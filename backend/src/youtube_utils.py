@@ -28,6 +28,27 @@ YOUTUBE_DOWNLOAD_PROVIDER_APIFY = "apify"
 YOUTUBE_DATA_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 
 
+def _default_youtube_extractor_args() -> Dict[str, Any]:
+    return {
+        "youtube": {
+            "player_client": ["mweb", "visionos", "web_embedded"],
+            "player_skip": ["webpage"],
+        }
+    }
+
+
+def _resolve_youtube_cookiefile() -> Optional[str]:
+    import os
+
+    cookie_path = (os.getenv("YOUTUBE_COOKIES_FILE") or "").strip()
+    if cookie_path and Path(cookie_path).is_file():
+        return cookie_path
+    default_cookie = Path(get_config().temp_dir) / "cookies.txt"
+    if default_cookie.is_file():
+        return str(default_cookie)
+    return None
+
+
 class YouTubeDownloader:
     """Enhanced YouTube downloader with optimized settings."""
 
@@ -42,7 +63,7 @@ class YouTubeDownloader:
         """Get optimal yt-dlp options for high-quality downloads."""
         output_path = self.temp_dir / f"{video_id}.%(ext)s"
 
-        opts = {
+        opts: Dict[str, Any] = {
             "outtmpl": str(output_path),
             # Use best available video/audio to avoid quality caps from container constraints.
             "format": "bestvideo*+bestaudio/best",
@@ -76,13 +97,17 @@ class YouTubeDownloader:
             "nocheckcertificate": True,
             "prefer_insecure": False,
             "age_limit": None,
+            "extractor_args": _default_youtube_extractor_args(),
         }
+        cookiefile = _resolve_youtube_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
 
         return opts
 
 
 def _build_info_options() -> Dict[str, Any]:
-    ydl_opts = {
+    ydl_opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "extractaudio": False,
@@ -95,7 +120,11 @@ def _build_info_options() -> Dict[str, Any]:
             "Connection": "keep-alive",
         },
         "nocheckcertificate": True,
+        "extractor_args": _default_youtube_extractor_args(),
     }
+    cookiefile = _resolve_youtube_cookiefile()
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
     return ydl_opts
 
 

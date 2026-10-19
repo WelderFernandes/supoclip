@@ -268,6 +268,8 @@ def transcribe_with_youtube_captions(video_url: str) -> Optional[str]:
     subs_path = temp_dir / f"{video_id}.en.vtt"
 
     try:
+        from ..youtube_utils import _default_youtube_extractor_args, _resolve_youtube_cookiefile
+
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -277,7 +279,11 @@ def transcribe_with_youtube_captions(video_url: str) -> Optional[str]:
             "subtitlesformat": "vtt",
             "skip_download": True,
             "outtmpl": str(temp_dir / video_id),
+            "extractor_args": _default_youtube_extractor_args(),
         }
+        cookiefile = _resolve_youtube_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
 
@@ -340,6 +346,18 @@ def get_video_transcript(
     return _get_transcript_with_assemblyai(video_path, speech_model, runtime_config)
 
 
+_ASSEMBLYAI_REGIONAL_LANGUAGE_CODES = frozenset({"de_ch", "en_au", "en_uk", "en_us"})
+
+
+def _assemblyai_language_code(language: Optional[str]) -> Optional[str]:
+    normalized = (language or "").strip().lower().replace("-", "_")
+    if not normalized or normalized == "auto":
+        return None
+    if normalized in _ASSEMBLYAI_REGIONAL_LANGUAGE_CODES:
+        return normalized
+    return normalized.split("_", 1)[0]
+
+
 def _get_transcript_with_assemblyai(
     video_path: Path, speech_model: str, runtime_config
 ) -> str:
@@ -354,13 +372,13 @@ def _get_transcript_with_assemblyai(
 
     # Without a language, AssemblyAI assumes US English and garbles everything
     # else; detection also routes to the first listed model that supports it.
-    language = runtime_config.transcription_language
+    language = _assemblyai_language_code(runtime_config.transcription_language)
     config_obj = aai.TranscriptionConfig(
         speaker_labels=True,
         punctuate=True,
         format_text=True,
         speech_models=speech_models_value,
-        language_code=language or None,
+        language_code=language,
         language_detection=None if language else True,
     )
 

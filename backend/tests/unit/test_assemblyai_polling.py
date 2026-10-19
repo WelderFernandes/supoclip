@@ -112,7 +112,7 @@ def test_submission_timeout_is_not_retried(monkeypatch):
 
 @pytest.mark.parametrize(
     ("language", "expected_code", "expected_detection"),
-    [("", None, True), ("es", "es", None)],
+    [("", None, True), ("es", "es", None), ("pt_br", "pt", None), ("en_us", "en_us", None)],
 )
 def test_language_is_detected_unless_configured(
     monkeypatch, tmp_path, language, expected_code, expected_detection
