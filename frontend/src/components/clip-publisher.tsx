@@ -12,6 +12,7 @@ import {
   RefreshCw,
   RotateCcw,
   Send,
+  Sparkles,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -61,12 +62,18 @@ import {
   type SocialPrivacyLevel,
   type SocialProviderStatus,
 } from "@/lib/social";
+import {
+  hashtagsToInput,
+  publishingCopyFor,
+  type PublishingMetadata,
+} from "@/lib/publishing-copy";
 
 interface PublishableClip {
   id: string;
   clip_order: number;
   hook_title: string | null;
   text: string | null;
+  publishing_metadata?: PublishingMetadata | null;
 }
 
 interface ClipPublishButtonProps {
@@ -75,6 +82,7 @@ interface ClipPublishButtonProps {
   connections: SocialConnection[];
   providers: SocialProviderStatus[];
   onChanged: () => void | Promise<void>;
+  onClipUpdated?: () => void | Promise<void>;
 }
 
 interface ClipPostListProps {
@@ -299,6 +307,7 @@ export function ClipPublishButton({
   connections,
   providers,
   onChanged,
+  onClipUpdated,
 }: ClipPublishButtonProps) {
   const [open, setOpen] = useState(false);
   const [accountId, setAccountId] = useState<string>("");
@@ -309,6 +318,7 @@ export function ClipPublishButton({
   const [schedule, setSchedule] = useState(false);
   const [scheduledFor, setScheduledFor] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const activeConnections = useMemo(
@@ -324,6 +334,24 @@ export function ClipPublishButton({
   const privacyOptions = privacyOptionsFor(providerForAccount(accountId));
   const anyProviderConfigured = providers.some((provider) => provider.configured);
 
+  // Fill the three text fields from whichever copy applies to the chosen
+  // account, falling back to the on-screen hook and the raw transcript.
+  const applyCopy = (
+    target: PublishableClip,
+    provider: SocialProviderStatus | undefined,
+  ) => {
+    const generated = publishingCopyFor(target.publishing_metadata, provider?.provider);
+    if (generated && (generated.title.trim() || generated.description.trim())) {
+      setTitle(generated.title.trim() || target.hook_title || `Clip ${target.clip_order}`);
+      setCaption(generated.description.trim() || target.text || "");
+      setHashtags(hashtagsToInput(generated));
+      return;
+    }
+    setTitle(target.hook_title || `Clip ${target.clip_order}`);
+    setCaption(target.text || "");
+    setHashtags("");
+  };
+
   // The form resets only when the sheet opens, so connections refreshing in
   // the background never wipe what the user is typing.
   const openSheet = () => {
@@ -331,9 +359,7 @@ export function ClipPublishButton({
       ? accountId
       : (activeConnections[0]?.id ?? "");
     setError(null);
-    setTitle(clip.hook_title || `Clip ${clip.clip_order}`);
-    setCaption(clip.text || "");
-    setHashtags("");
+    applyCopy(clip, providerForAccount(nextAccountId));
     setSchedule(false);
     setScheduledFor(toLocalDateTimeInput(new Date(Date.now() + 60 * 60 * 1000)));
     setAccountId(nextAccountId);
@@ -344,10 +370,44 @@ export function ClipPublishButton({
   const selectAccount = (id: string) => {
     setAccountId(id);
     setPrivacy(defaultPrivacyFor(providerForAccount(id)));
+    // Every platform has its own generated copy, so swap it in with the account.
+    if (clip.publishing_metadata) {
+      applyCopy(clip, providerForAccount(id));
+    }
   };
 
   // Without a configured platform there is nothing to publish to.
   if (!anyProviderConfigured) return null;
+
+  const regenerateCopy = async () => {
+    setRegenerating(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/tasks/${taskId}/clips/${clip.id}/publishing-metadata`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        throw new Error(
+          await readError(response, "Could not write titles and descriptions"),
+        );
+      }
+      const { clip: updated } = (await response.json()) as { clip?: PublishableClip };
+      if (updated) {
+        applyCopy(updated, providerForAccount(accountId));
+      }
+      await onClipUpdated?.();
+      toast.success("Titles and descriptions ready", {
+        description: "Edit them before publishing if you want a different angle.",
+      });
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not write titles and descriptions",
+      );
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   const handleSubmit = async () => {
     if (!accountId) {
@@ -459,7 +519,28 @@ export function ClipPublishButton({
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor={`publish-title-${clip.id}`}>Title</Label>
+                  <div className="flex items-center justify-between gap-2">
+                    <Label htmlFor={`publish-title-${clip.id}`}>Title</Label>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs"
+                      onClick={regenerateCopy}
+                      disabled={regenerating || isSubmitting}
+                    >
+                      {regenerating ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Sparkles className="size-3.5" />
+                      )}
+                      {regenerating
+                        ? "Writing…"
+                        : clip.publishing_metadata
+                          ? "Regenerate"
+                          : "Generate with AI"}
+                    </Button>
+                  </div>
                   <Input
                     id={`publish-title-${clip.id}`}
                     value={title}

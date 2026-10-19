@@ -58,9 +58,11 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip
 import Link from "next/link";
 import { ClipTile, ClipFocus, ProcessingPanel, EmptyState } from "@/components/app/clip-wall";
 import { timeAgo } from "@/lib/generations";
+import { type PublishingMetadata } from "@/lib/publishing-copy";
 import { cn } from "@/lib/utils";
 import { FontSelectOption, type FontOption } from "@/components/font-select-option";
 import { ClipPostList, ClipPublishButton, useSocialPostToasts } from "@/components/clip-publisher";
+import { ClipPublishingCopy } from "@/components/clip-publishing-copy";
 import {
   ACTIVE_POST_STATUSES,
   type SocialConnection,
@@ -89,6 +91,7 @@ interface Clip {
   shareability_score: number;
   hook_type: string | null;
   hook_title: string | null;
+  publishing_metadata?: PublishingMetadata | null;
 }
 
 interface TaskDetails {
@@ -821,14 +824,28 @@ export default function TaskPage() {
             connections={socialConnections}
             providers={socialProviders}
             onChanged={loadSocialPosts}
+            onClipUpdated={() => {
+              void fetchTaskStatus(0, 0, true);
+            }}
           />
         ) : null}
       >
         {focusedClip && (
-          <ClipPostList
-            posts={socialPosts.filter((post) => post.clip_id === focusedClip.id)}
-            onChanged={loadSocialPosts}
-          />
+          <>
+            <ClipPublishingCopy
+              key={focusedClip.id}
+              taskId={task?.id ?? String(params.id)}
+              clipId={focusedClip.id}
+              metadata={focusedClip.publishing_metadata}
+              onChanged={() => {
+                void fetchTaskStatus(0, 0, true);
+              }}
+            />
+            <ClipPostList
+              posts={socialPosts.filter((post) => post.clip_id === focusedClip.id)}
+              onChanged={loadSocialPosts}
+            />
+          </>
         )}
       </ClipFocus>
 

@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { getClipUrl } from "@/lib/clip-actions";
 import { formatClipDuration } from "@/lib/generations";
+import { type PublishingMetadata } from "@/lib/publishing-copy";
 import { cn } from "@/lib/utils";
 
 export interface WallClip {
@@ -32,6 +33,8 @@ export interface WallClip {
   shareability_score: number;
   hook_type: string | null;
   hook_title: string | null;
+  /** AI-written titles, descriptions and hashtags; absent until generated. */
+  publishing_metadata?: PublishingMetadata | null;
 }
 
 function clipTitle(clip: WallClip) {
