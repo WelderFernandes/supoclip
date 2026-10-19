@@ -294,6 +294,11 @@ class GeneratedClip(Base):
         Integer, nullable=True, server_default=sql_text("'0'")
     )
     hook_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # Viral titles, descriptions and hashtags written for the publishing UI.
+    # Shape: {"generic": {...}, "platforms": {"youtube": {...}, ...}}.
+    publishing_metadata: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

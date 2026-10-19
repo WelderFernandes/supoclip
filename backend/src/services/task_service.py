@@ -3,7 +3,7 @@ Task service - orchestrates task creation and processing workflow.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, List
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +30,11 @@ from .task_completion_email_service import (
 from ..config import Config, get_config
 from ..youtube_utils import cleanup_downloaded_files, extract_video_id
 from ..clip_cleanup import normalize_clip_cleanup_settings
-from ..ai import TRANSCRIPT_ANALYSIS_CACHE_VERSION
+from ..ai import (
+    TRANSCRIPT_ANALYSIS_CACHE_VERSION,
+    PUBLISHING_PLATFORMS,
+    generate_clips_publishing_metadata,
+)
 from ..clip_source_map import load_clip_caption_settings
 from ..media_storage import MediaStorage, media_work
 from ..utils.async_helpers import run_in_thread
@@ -485,6 +489,21 @@ class TaskService(ClipEditingMixin):
             if not clip_ids:
                 raise ValueError("No clips could be rendered. Please try again.")
 
+            # Viral titles, descriptions and hashtags for the publishing UI. This
+            # is a separate model call from clip selection, so a failure here must
+            # never fail a generation whose clips already rendered.
+            await update_progress(97, "Writing viral titles and descriptions...")
+            try:
+                await self.generate_clip_publishing_metadata(
+                    task_id, clip_ids=clip_ids
+                )
+            except TaskCancelled:
+                raise
+            except Exception:
+                logger.exception(
+                    "Publishing metadata generation failed for task %s", task_id
+                )
+
             # A cancellation committed after the final render must win over completion.
             await check_cancelled()
             completed = await self.task_repo.update_task_status(
@@ -698,6 +717,56 @@ class TaskService(ClipEditingMixin):
         task.update(await self._load_task_source_settings(task_id))
 
         return task
+
+    async def generate_clip_publishing_metadata(
+        self,
+        task_id: str,
+        clip_ids: Optional[List[str]] = None,
+        platforms: Optional[List[str]] = None,
+        force: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Write viral titles, descriptions and hashtags for a task's clips.
+
+        This runs as its own model call, separate from clip selection, so it can
+        be refreshed without rescoring the clips. Existing copy is kept unless
+        ``force`` is set or a clip has none yet. Returns the task's clips after
+        the update.
+        """
+        clips = await self.clip_repo.get_clips_by_task(self.db, task_id)
+        if clip_ids is not None:
+            wanted = set(clip_ids)
+            clips = [clip for clip in clips if clip["id"] in wanted]
+        if not clips:
+            return []
+
+        targets = (
+            clips
+            if force
+            else [clip for clip in clips if not clip.get("publishing_metadata")]
+        )
+
+        if targets:
+            payload = [
+                {
+                    "clip_number": index,
+                    "hook_title": clip.get("hook_title"),
+                    "text": clip.get("text"),
+                }
+                for index, clip in enumerate(targets, start=1)
+            ]
+            generated = await generate_clips_publishing_metadata(
+                payload, platforms or PUBLISHING_PLATFORMS
+            )
+            generated_at = datetime.utcnow().isoformat()
+            for index, clip in enumerate(targets, start=1):
+                copy = generated.get(index)
+                if not copy:
+                    continue
+                await self.clip_repo.update_clip_publishing_metadata(
+                    self.db, clip["id"], {**copy, "generated_at": generated_at}
+                )
+
+        return await self.clip_repo.get_clips_by_task(self.db, task_id)
 
     async def get_user_tasks(
         self, user_id: str, limit: int = 50

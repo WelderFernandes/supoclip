@@ -971,6 +971,36 @@ async def regenerate_clip(
         )
 
 
+@router.post("/{task_id}/clips/{clip_id}/publishing-metadata")
+async def regenerate_clip_publishing_metadata(
+    task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Rewrite the viral title, description and hashtags for one clip."""
+    try:
+        task_service = TaskService(db)
+        await _require_task_owner(request, task_service, db, task_id)
+        clips = await task_service.generate_clip_publishing_metadata(
+            task_id, clip_ids=[clip_id], force=True
+        )
+        updated = next((clip for clip in clips if clip["id"] == clip_id), None)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Clip not found")
+        return {"clip": updated}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error generating publishing metadata: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not write titles and descriptions right now. "
+                "Please try again shortly."
+            ),
+        )
+
+
 @router.post("/{task_id}/settings")
 async def apply_task_settings(
     task_id: str, request: Request, db: AsyncSession = Depends(get_db)

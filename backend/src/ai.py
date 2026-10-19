@@ -3,7 +3,7 @@ AI-related functions for transcript analysis with enhanced precision and viralit
 """
 
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Sequence
 import asyncio
 import logging
 import math
@@ -56,6 +56,24 @@ SECONDS_PER_FINAL_CLIP = 5 * 60
 TRANSIENT_MODEL_STATUS_CODES = {408, 429, 500, 502, 503, 504, 529}
 HOOK_TITLE_MAX_CHARS = 64
 HOOK_TITLE_MAX_WORDS = 10
+
+# --- Publishing metadata (viral titles, descriptions and hashtags) -----------
+# Titles are trimmed on a word boundary and descriptions on a sentence or word
+# boundary, so the values handed to the publishing UI never exceed the limits
+# the platforms enforce at upload time.
+GENERIC_TEXT_LIMITS = {"title": 100, "description": 2200, "hashtags": 15}
+PLATFORM_TEXT_LIMITS: Dict[str, Dict[str, int]] = {
+    "youtube": {"title": 100, "description": 5000, "hashtags": 15},
+    "tiktok": {"title": 150, "description": 2200, "hashtags": 10},
+    "instagram": {"title": 150, "description": 2200, "hashtags": 30},
+}
+PUBLISHING_PLATFORMS: tuple[str, ...] = tuple(PLATFORM_TEXT_LIMITS)
+# Copywriting runs in batches so a task with many clips cannot overflow one
+# model response.
+PUBLISHING_METADATA_BATCH_SIZE = 5
+PUBLISHING_METADATA_TIMEOUT_SECONDS = 300
+PUBLISHING_MAX_HASHTAG_CHARS = 40
+
 # The transcript formatter does not wrap minutes into hours, so sources of 100+
 # minutes produce labels such as "100:05".
 TRANSCRIPT_SPAN_RE = re.compile(
@@ -665,6 +683,317 @@ def get_rerank_agent() -> Agent[None, CandidateRanking]:
         )
         _rerank_agent_signature = signature
     return _rerank_agent
+
+
+# ---------------------------------------------------------------------------
+# Publishing metadata: viral titles, descriptions and hashtags for clips
+# ---------------------------------------------------------------------------
+
+
+class PlatformCopy(BaseModel):
+    """One platform-ready headline, description body and hashtag set."""
+
+    title: str = Field(
+        default="",
+        description="Short headline shown by the platform, for example a YouTube title",
+    )
+    description: str = Field(
+        default="",
+        description="Post description or caption body, written without hashtags",
+    )
+    hashtags: List[str] = Field(
+        default_factory=list,
+        description="Hashtags without the leading # character",
+    )
+
+
+class ClipPublishingCopy(BaseModel):
+    """Publishing copy for one clip: a neutral version plus per-platform takes."""
+
+    clip_number: int = Field(description="The clip_number this copy belongs to")
+    generic: Optional[PlatformCopy] = Field(
+        default=None, description="Neutral copy that works on any platform"
+    )
+    youtube: Optional[PlatformCopy] = Field(
+        default=None, description="Copy tuned for YouTube Shorts"
+    )
+    tiktok: Optional[PlatformCopy] = Field(
+        default=None, description="Copy tuned for TikTok"
+    )
+    instagram: Optional[PlatformCopy] = Field(
+        default=None, description="Copy tuned for Instagram Reels"
+    )
+
+
+class ClipsPublishingMetadata(BaseModel):
+    """Publishing copy for every clip in one batch."""
+
+    clips: List[ClipPublishingCopy] = Field(
+        description="One entry per requested clip, keyed by clip_number"
+    )
+
+
+publishing_metadata_system_prompt = """You are a social media copywriter for short-form video.
+
+You receive clips taken from one long video. For each clip, write the copy that will be used to publish it on social platforms.
+
+OUTPUT CONTRACT:
+- Return valid JSON only. No Markdown, no code fences, no text outside the JSON object.
+- The top-level object must be {"clips": [...]} with one entry per received clip, shaped like:
+  {"clip_number": 1, "generic": {"title": "", "description": "", "hashtags": []}, "youtube": {...}, "tiktok": {...}, "instagram": {...}}
+- Each copy object contains exactly "title", "description" and "hashtags".
+- Set a platform variant to null when that platform was not requested.
+- Use every received clip_number exactly once and never invent clips that were not provided.
+
+GROUNDING RULES:
+- Base every claim strictly on the clip transcript. Never invent facts, numbers, names, promises or outcomes the clip does not contain.
+- Never write a hook the clip fails to pay off. No bait.
+- Write in the same language as the clip transcript.
+- Do not repeat the clip's opening sentence verbatim; reframe it as a hook.
+
+WHAT GOOD COPY LOOKS LIKE:
+- The title leads with the hook: a bold claim, a curiosity gap, a number, a mistake, or real stakes taken from the clip.
+- The description adds one or two sentences of context or value and ends with a short call to action, for example "Save this" or "Follow for more".
+- Concrete beats generic. Plain, punchy sentences. No corporate filler.
+- No hashtags inside the title or the description body. No emojis in titles.
+
+PER PLATFORM:
+- youtube: searchable and descriptive. The title carries the hook and the main keyword.
+- tiktok: casual, first person, trend aware. The caption carries the hook; the title is just a short internal label.
+- instagram: aesthetic and community oriented. The caption should invite saves, shares or comments.
+- generic: a neutral version usable anywhere.
+
+HASHTAGS:
+- Give each copy 6 to 12 hashtags. Mix two or three broad tags with several niche, topic specific ones.
+- Write them without the leading # and without spaces inside a tag.
+- Never repeat a tag inside the same list.
+
+Keep titles tight and descriptions to two to four sentences."""
+
+_publishing_metadata_agent: Optional[Agent[None, ClipsPublishingMetadata]] = None
+_publishing_metadata_agent_signature: Optional[tuple[str | None, ...]] = None
+
+
+def get_publishing_metadata_agent() -> Agent[None, ClipsPublishingMetadata]:
+    """Get or create the publishing copy agent (lazy initialization)."""
+    global _publishing_metadata_agent, _publishing_metadata_agent_signature
+    runtime_config = get_config()
+    model_name = runtime_config.llm
+    provider, _ = _split_llm_name(model_name)
+    signature = (
+        runtime_config.llm,
+        runtime_config.openai_api_key,
+        runtime_config.openrouter_api_key,
+        runtime_config.openrouter_fallback_model,
+        runtime_config.google_api_key,
+        runtime_config.anthropic_api_key,
+        runtime_config.ollama_base_url,
+        runtime_config.ollama_api_key,
+    )
+    if (
+        _publishing_metadata_agent is None
+        or _publishing_metadata_agent_signature != signature
+    ):
+        apply_settings_to_process_env(runtime_config.as_runtime_settings())
+        config_error = _get_missing_llm_key_error(model_name, runtime_config)
+        if config_error:
+            raise RuntimeError(config_error)
+
+        _publishing_metadata_agent = Agent[None, ClipsPublishingMetadata](
+            model=_build_transcript_model(runtime_config, model_name),
+            output_type=(
+                NativeOutput(ClipsPublishingMetadata, strict=True)
+                if provider == "openrouter"
+                else ClipsPublishingMetadata
+            ),
+            system_prompt=publishing_metadata_system_prompt,
+            output_retries=2,
+        )
+        _publishing_metadata_agent_signature = signature
+    return _publishing_metadata_agent
+
+
+def build_publishing_metadata_prompt(
+    clips: List[Dict[str, Any]], platforms: Sequence[str]
+) -> str:
+    """Describe each clip so the writer can produce grounded copy for it."""
+    blocks = []
+    for clip in clips:
+        blocks.append(
+            f"clip_number: {clip['clip_number']}\n"
+            f"current on-screen hook: {clip.get('hook_title') or '(none)'}\n"
+            f"transcript: {clip.get('text') or '(empty)'}"
+        )
+    requested = ", ".join(platforms) if platforms else "none"
+    return (
+        f"Write publishing copy for these {len(clips)} clips.\n"
+        f"Requested platform variants: {requested}.\n"
+        "Set every unrequested platform variant to null.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _strip_inline_markdown(text: str) -> str:
+    """Remove bold, italic and code markers that models wrap around prose."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text
+
+
+def _clean_markdown_lines(raw: Any) -> str:
+    """Strip fences and list markers that models add around prose blocks."""
+    text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for line in text.split("\n"):
+        line = re.sub(r"^\s{0,3}(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", "", line)
+        lines.append(line.rstrip())
+    text = "\n".join(lines)
+    text = _strip_inline_markdown(text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text.strip("`").strip()
+
+
+def _truncate_on_boundary(text: str, limit: int) -> str:
+    """Trim to the limit, preferring a word boundary over a hard cut."""
+    if len(text) <= limit:
+        return text
+    window = text[: limit + 1]
+    cut = window.rfind(" ")
+    if cut < limit * 0.6:
+        cut = limit
+    return window[:cut].rstrip(" ,;:.-–—")
+
+
+# A hashtag is a whole whitespace-delimited token. Matching only \w would leave
+# the tail of tags like #dicas-de-tech behind as stray text.
+_HASHTAG_TOKEN_RE = re.compile(r"#[^\s#]+")
+
+
+def sanitize_publishing_title(raw: Any, limit: int) -> str:
+    """Normalize a feed title: single line, no hashtags, capped at the limit."""
+    title = str(raw or "").strip().strip("\"'`“”‘’").strip()
+    title = _strip_inline_markdown(title)
+    title = _HASHTAG_TOKEN_RE.sub("", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    # Keep ? and ! because they carry the hook.
+    title = title.rstrip(".,;:-–— ").strip()
+    return _truncate_on_boundary(title, limit)
+
+
+def sanitize_publishing_description(raw: Any, limit: int) -> str:
+    """Normalize a caption body; hashtags are dropped and travel separately."""
+    text = _clean_markdown_lines(raw)
+    text = _HASHTAG_TOKEN_RE.sub("", text)
+    # Stripping a hashtag can leave a line empty or space padded, so tidy each
+    # line before collapsing the blank runs it may have created.
+    text = "\n".join(
+        re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return _truncate_on_boundary(text, limit)
+
+
+def sanitize_publishing_hashtags(raw: Any, limit: int) -> List[str]:
+    """Keep unique, tag-safe hashtags without the leading # character."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    # A model may put "tag one, tag two" in a single list entry; split it.
+    candidates: List[str] = []
+    for item in raw:
+        candidates.extend(re.split(r"[\s,]+", str(item or "")))
+    tags: List[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        tag = re.sub(
+            r"[^\w]", "", item.strip().lstrip("#"), flags=re.UNICODE
+        )
+        if not tag or len(tag) > PUBLISHING_MAX_HASHTAG_CHARS:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+        if len(tags) >= limit:
+            break
+    return tags
+
+
+def _normalize_platform_copy(
+    copy: Optional[PlatformCopy], limits: Dict[str, int]
+) -> Dict[str, Any]:
+    return {
+        "title": sanitize_publishing_title(
+            getattr(copy, "title", "") if copy else "", limits["title"]
+        ),
+        "description": sanitize_publishing_description(
+            getattr(copy, "description", "") if copy else "", limits["description"]
+        ),
+        "hashtags": sanitize_publishing_hashtags(
+            getattr(copy, "hashtags", []) if copy else [], limits["hashtags"]
+        ),
+    }
+
+
+def normalize_publishing_metadata(
+    raw: ClipsPublishingMetadata, platforms: Sequence[str]
+) -> Dict[int, Dict[str, Any]]:
+    """Sanitize one batch into {clip_number: {"generic": ..., "platforms": ...}}.
+
+    A platform the model left empty falls back to the neutral copy so the
+    publishing UI is never blank.
+    """
+    normalized: Dict[int, Dict[str, Any]] = {}
+    for entry in raw.clips:
+        generic = _normalize_platform_copy(entry.generic, GENERIC_TEXT_LIMITS)
+        platform_copies: Dict[str, Any] = {}
+        for platform in platforms:
+            source = getattr(entry, platform, None)
+            platform_copies[platform] = (
+                dict(generic)
+                if source is None
+                else _normalize_platform_copy(source, PLATFORM_TEXT_LIMITS[platform])
+            )
+        normalized[int(entry.clip_number)] = {
+            "generic": generic,
+            "platforms": platform_copies,
+        }
+    return normalized
+
+
+async def generate_clips_publishing_metadata(
+    clips: List[Dict[str, Any]],
+    platforms: Sequence[str] = PUBLISHING_PLATFORMS,
+) -> Dict[int, Dict[str, Any]]:
+    """Write viral copy for each clip, batched, keyed by clip_number.
+
+    Each entry in ``clips`` needs ``clip_number`` and ``text`` and may carry
+    ``hook_title``. Failures propagate so callers can decide whether the run is
+    best-effort (task pipeline) or user-visible (manual regeneration).
+    """
+    if not clips:
+        return {}
+    requested = [
+        platform for platform in platforms if platform in PLATFORM_TEXT_LIMITS
+    ]
+
+    agent = get_publishing_metadata_agent()
+    results: Dict[int, Dict[str, Any]] = {}
+    for start in range(0, len(clips), PUBLISHING_METADATA_BATCH_SIZE):
+        batch = clips[start : start + PUBLISHING_METADATA_BATCH_SIZE]
+        prompt = build_publishing_metadata_prompt(batch, requested)
+        result = await _run_transcript_analysis(
+            agent, prompt, PUBLISHING_METADATA_TIMEOUT_SECONDS
+        )
+        output = getattr(result, "output", None)
+        if output is None:
+            logger.warning("Publishing metadata batch returned no output; skipping")
+            continue
+        results.update(normalize_publishing_metadata(output, requested))
+    return results
 
 
 def _performance_history_section(performance_context: str | None) -> str:

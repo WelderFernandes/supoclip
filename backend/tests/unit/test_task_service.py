@@ -79,6 +79,8 @@ def build_task_service() -> TaskService:
     service.task_repo.get_task_notification_context = AsyncMock(return_value=None)
     service.clip_repo.delete_clips_by_task = AsyncMock(return_value=0)
     service.clip_repo.create_clip = AsyncMock(return_value="clip-1")
+    # The pipeline asks for the rendered clips again to write publishing copy.
+    service.clip_repo.get_clips_by_task = AsyncMock(return_value=[])
     service.video_service.create_single_clip = AsyncMock(return_value=build_clip_result())
     service.video_service.apply_single_transition = AsyncMock(
         side_effect=lambda _prev_clip_path, clip_info, _index, _clips_output_dir: clip_info
@@ -608,6 +610,40 @@ async def test_process_task_keeps_successful_output_when_one_render_fails(tmp_pa
 
     assert result["clips_count"] == 1
     service.clip_repo.create_clip.assert_awaited_once()
+    service.task_repo.update_task_status.assert_any_await(
+        service.db, "task-1", "completed", progress=100,
+        progress_message="Complete!", expected_statuses=["processing"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_task_writes_publishing_copy_for_the_rendered_clips(tmp_path):
+    service = build_task_service()
+    service.config.temp_dir = str(tmp_path)
+    service.generate_clip_publishing_metadata = AsyncMock()
+
+    await service.process_task(
+        task_id="task-1", url="upload://source.mp4", source_type="video_url"
+    )
+
+    service.generate_clip_publishing_metadata.assert_awaited_once_with(
+        "task-1", clip_ids=["clip-1"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_task_completes_even_when_copywriting_fails(tmp_path):
+    service = build_task_service()
+    service.config.temp_dir = str(tmp_path)
+    service.generate_clip_publishing_metadata = AsyncMock(
+        side_effect=RuntimeError("model unavailable")
+    )
+
+    result = await service.process_task(
+        task_id="task-1", url="upload://source.mp4", source_type="video_url"
+    )
+
+    assert result["clips_count"] == 1
     service.task_repo.update_task_status.assert_any_await(
         service.db, "task-1", "completed", progress=100,
         progress_message="Complete!", expected_statuses=["processing"],

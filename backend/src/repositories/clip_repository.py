@@ -11,6 +11,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text as sa_text
 from typing import List, Dict, Any, Optional
+import json
 import logging
 from uuid import uuid4
 
@@ -149,7 +150,7 @@ class ClipRepository:
                         SELECT id, filename, file_path, start_time, end_time, duration,
                                text, relevance_score, reasoning, clip_order, created_at,
                                virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type,
-                               hook_title
+                               hook_title, publishing_metadata
                         FROM generated_clips
                         WHERE task_id = :task_id
                         ORDER BY clip_order ASC
@@ -193,6 +194,7 @@ class ClipRepository:
                     "shareability_score": getattr(row, "shareability_score", 0) or 0,
                     "hook_type": getattr(row, "hook_type", None),
                     "hook_title": getattr(row, "hook_title", None),
+                    "publishing_metadata": getattr(row, "publishing_metadata", None),
                 }
             )
 
@@ -257,7 +259,7 @@ class ClipRepository:
                         SELECT id, task_id, filename, file_path, start_time, end_time, duration,
                                text, relevance_score, reasoning, clip_order,
                                virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type,
-                               hook_title, created_at
+                               hook_title, publishing_metadata, created_at
                         FROM generated_clips
                         WHERE id = :clip_id
                         """
@@ -301,6 +303,7 @@ class ClipRepository:
             "shareability_score": getattr(row, "shareability_score", 0) or 0,
             "hook_type": getattr(row, "hook_type", None),
             "hook_title": getattr(row, "hook_title", None),
+            "publishing_metadata": getattr(row, "publishing_metadata", None),
             "created_at": row.created_at.isoformat(),
             "video_url": f"/tasks/{row.task_id}/clips/{row.id}/file",
         }
@@ -350,6 +353,38 @@ class ClipRepository:
                 "text": text,
             },
         )
+        await commit_unless_editing(db)
+
+    @staticmethod
+    async def update_clip_publishing_metadata(
+        db: AsyncSession, clip_id: str, metadata: Dict[str, Any]
+    ) -> None:
+        """Store the generated viral copy for one clip.
+
+        A deployment whose database predates the column keeps working: the
+        write is skipped instead of failing the surrounding generation.
+        """
+        try:
+            async with db.begin_nested():
+                await db.execute(
+                    sa_text(
+                        """
+                        UPDATE generated_clips
+                        SET publishing_metadata = CAST(:metadata AS JSONB),
+                            updated_at = NOW()
+                        WHERE id = :clip_id
+                        """
+                    ),
+                    {"clip_id": clip_id, "metadata": json.dumps(metadata)},
+                )
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) != "42703":
+                raise
+            logger.warning(
+                "generated_clips.publishing_metadata is missing; apply the "
+                "20261018_0001_clip_publishing_metadata migration to store it"
+            )
+            return
         await commit_unless_editing(db)
 
     @staticmethod
