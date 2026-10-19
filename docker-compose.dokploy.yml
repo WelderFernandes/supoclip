@@ -1,0 +1,466 @@
+# =============================================================================
+# SupoClip — Docker Compose para produção (VPS / Dokploy)
+# =============================================================================
+# Este arquivo é uma variante de produção do docker-compose.yml.
+# O docker-compose.yml original continua servindo o desenvolvimento local.
+#
+# Ele já incorpora o checklist oficial do app (self-hosting-guide-article.tsx):
+#   - frontend com build de produção (target `runner`)
+#   - sem bind mounts de código-fonte (a imagem já contém o build)
+#   - senha do Postgres parametrizada nos 4 lugares (upstream hardcoda)
+#   - rede dokploy-network para o Traefik da Dokploy rotear
+#
+# USO NA DOKPLOY
+#   Compose Path: ./docker-compose.dokploy.yml
+#   Environment:  cole o conteúdo do seu .env de produção (Dokploy grava um
+#                 .env ao lado do compose; este arquivo lê via ${VAR}).
+#
+# ANTES DE SUBIR: preencha o .env.production.example e troque os segredos.
+# =============================================================================
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # `runner` é o estágio standalone de produção do frontend/Dockerfile.
+      # `development` (padrão do compose original) roda `pnpm run dev`.
+      target: runner
+      args:
+        # ATENÇÃO: NEXT_PUBLIC_* são embutidos em tempo de build.
+        # Mudar qualquer um exige REBUILD, não apenas restart.
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+        - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+        - NEXT_PUBLIC_SELF_HOST=${SELF_HOST:-true}
+        - NEXT_PUBLIC_PRO_PRICE_MONTHLY=${NEXT_PUBLIC_PRO_PRICE_MONTHLY:-10}
+        - NEXT_PUBLIC_SCALE_PRICE_MONTHLY=${NEXT_PUBLIC_SCALE_PRICE_MONTHLY:-50}
+        - NEXT_PUBLIC_FREE_PLAN_TASK_LIMIT=${NEXT_PUBLIC_FREE_PLAN_TASK_LIMIT:-10}
+        - NEXT_PUBLIC_PRO_PLAN_TASK_LIMIT=${NEXT_PUBLIC_PRO_PLAN_TASK_LIMIT:-50}
+        - NEXT_PUBLIC_SCALE_PLAN_TASK_LIMIT=${NEXT_PUBLIC_SCALE_PLAN_TASK_LIMIT:-300}
+        - NEXT_PUBLIC_DATAFAST_WEBSITE_ID=${NEXT_PUBLIC_DATAFAST_WEBSITE_ID:-}
+        - NEXT_PUBLIC_DATAFAST_DOMAIN=${NEXT_PUBLIC_DATAFAST_DOMAIN:-}
+        - NEXT_PUBLIC_DATAFAST_ALLOW_LOCALHOST=${NEXT_PUBLIC_DATAFAST_ALLOW_LOCALHOST:-false}
+    container_name: supoclip-frontend
+    # `expose` em vez de `ports`: só a rede interna do Docker alcança.
+    # O Traefik da Dokploy roteia o domínio público até aqui.
+    expose:
+      - "3107"
+    # NENHUM volume: a imagem `runner` já contém o build completo.
+    # (O compose original monta ./frontend/src, ./frontend/public e
+    #  ./frontend/prisma — mounts de desenvolvimento.)
+    environment:
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+      - BACKEND_INTERNAL_URL=http://backend:8000
+      - NEXT_PUBLIC_SELF_HOST=${SELF_HOST:-true}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+      - NEXT_PUBLIC_LANDING_ONLY_MODE=${NEXT_PUBLIC_LANDING_ONLY_MODE:-false}
+      - DISABLE_SIGN_UP=${DISABLE_SIGN_UP:-false}
+      - BACKEND_AUTH_SECRET=${BACKEND_AUTH_SECRET}
+      - APP_SETTINGS_ENCRYPTION_KEY=${APP_SETTINGS_ENCRYPTION_KEY}
+      - "DATABASE_URL=postgresql://supoclip:${POSTGRES_PASSWORD}@postgres:5432/supoclip"
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - BETTER_AUTH_URL=${BETTER_AUTH_URL}
+      - BETTER_AUTH_TRUSTED_ORIGINS=${BETTER_AUTH_TRUSTED_ORIGINS:-}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - "SES_FROM_EMAIL=${SES_FROM_EMAIL:-SupoClip <onboarding@example.com>}"
+      - NEXT_PUBLIC_DATAFAST_WEBSITE_ID=${NEXT_PUBLIC_DATAFAST_WEBSITE_ID:-}
+      - NEXT_PUBLIC_DATAFAST_DOMAIN=${NEXT_PUBLIC_DATAFAST_DOMAIN:-}
+      - NEXT_PUBLIC_DATAFAST_ALLOW_LOCALHOST=${NEXT_PUBLIC_DATAFAST_ALLOW_LOCALHOST:-false}
+      - NEXT_PUBLIC_FREE_PLAN_TASK_LIMIT=${NEXT_PUBLIC_FREE_PLAN_TASK_LIMIT:-10}
+      - NEXT_PUBLIC_PRO_PLAN_TASK_LIMIT=${NEXT_PUBLIC_PRO_PLAN_TASK_LIMIT:-50}
+      - NEXT_PUBLIC_SCALE_PLAN_TASK_LIMIT=${NEXT_PUBLIC_SCALE_PLAN_TASK_LIMIT:-300}
+      - NEXT_PUBLIC_PRO_PRICE_MONTHLY=${NEXT_PUBLIC_PRO_PRICE_MONTHLY:-10}
+      - NEXT_PUBLIC_SCALE_PRICE_MONTHLY=${NEXT_PUBLIC_SCALE_PRICE_MONTHLY:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3107/api/auth/get-session"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        BACKEND_CPU_ONLY: ${BACKEND_CPU_ONLY:-true}
+    container_name: supoclip-backend
+    # Sobrescreva com BACKEND_PLATFORM=linux/arm64 se a VPS for ARM.
+    platform: ${BACKEND_PLATFORM:-linux/amd64}
+    command:
+      [
+        ".venv/bin/uvicorn",
+        "src.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    # O backend PRECISA ser público: com BACKEND_AUTH_SECRET definido, o
+    # navegador envia o vídeo direto para NEXT_PUBLIC_API_URL.
+    expose:
+      - "8000"
+    volumes:
+      # Somente dados de execução. Fonts e transitions são copiados para
+      # dentro da imagem pelo backend/Dockerfile (COPY fonts/ transitions/),
+      # então não montamos ./backend/fonts nem ./backend/transitions.
+      - uploads:/app/uploads
+      - clips:/app/clips
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - "DATABASE_URL=postgresql+asyncpg://supoclip:${POSTGRES_PASSWORD}@postgres:5432/supoclip"
+      - TEMP_DIR=/app/uploads
+      - MEDIA_STORAGE=${MEDIA_STORAGE:-local}
+      - MEDIA_S3_BUCKET=${MEDIA_S3_BUCKET:-}
+      - MEDIA_S3_PREFIX=${MEDIA_S3_PREFIX:-media}
+      - MEDIA_S3_REGION=${MEDIA_S3_REGION:-eu-central-1}
+      - MEDIA_S3_ENDPOINT=${MEDIA_S3_ENDPOINT:-}
+      - MEDIA_S3_ACCESS_KEY_ID=${MEDIA_S3_ACCESS_KEY_ID:-}
+      - MEDIA_S3_SECRET_ACCESS_KEY=${MEDIA_S3_SECRET_ACCESS_KEY:-}
+      - MEDIA_S3_SESSION_TOKEN=${MEDIA_S3_SESSION_TOKEN:-}
+      - MEDIA_URL_TTL_SECONDS=${MEDIA_URL_TTL_SECONDS:-900}
+      - MEDIA_CACHE_TTL_SECONDS=${MEDIA_CACHE_TTL_SECONDS:-86400}
+      - MEDIA_ORPHAN_GRACE_SECONDS=${MEDIA_ORPHAN_GRACE_SECONDS:-86400}
+      - MEDIA_UPLOAD_CONCURRENCY=${MEDIA_UPLOAD_CONCURRENCY:-3}
+      - MEDIA_UPLOAD_DAILY_LIMIT=${MEDIA_UPLOAD_DAILY_LIMIT:-20}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - ASSEMBLY_AI_API_KEY=${ASSEMBLY_AI_API_KEY}
+      - ASSEMBLY_AI_HTTP_TIMEOUT_SECONDS=${ASSEMBLY_AI_HTTP_TIMEOUT_SECONDS:-900}
+      - APIFY_API_TOKEN=${APIFY_API_TOKEN:-}
+      - APIFY_YOUTUBE_DOWNLOADER_ACTOR=${APIFY_YOUTUBE_DOWNLOADER_ACTOR:-}
+      - APIFY_YOUTUBE_PROVIDERS=${APIFY_YOUTUBE_PROVIDERS:-}
+      - APIFY_STORAGE_BUCKET=${APIFY_STORAGE_BUCKET:-}
+      - APIFY_STORAGE_REGION=${APIFY_STORAGE_REGION:-}
+      - APIFY_STORAGE_WRITER_ACCESS_KEY_ID=${APIFY_STORAGE_WRITER_ACCESS_KEY_ID:-}
+      - APIFY_STORAGE_WRITER_SECRET_ACCESS_KEY=${APIFY_STORAGE_WRITER_SECRET_ACCESS_KEY:-}
+      - APIFY_STORAGE_READER_ACCESS_KEY_ID=${APIFY_STORAGE_READER_ACCESS_KEY_ID:-}
+      - APIFY_STORAGE_READER_SECRET_ACCESS_KEY=${APIFY_STORAGE_READER_SECRET_ACCESS_KEY:-}
+      - APIFY_STORAGE_KEY_TEMPLATE=${APIFY_STORAGE_KEY_TEMPLATE:-}
+      - APIFY_YOUTUBE_FALLBACK_ACTOR=${APIFY_YOUTUBE_FALLBACK_ACTOR:-}
+      - APIFY_YOUTUBE_FALLBACK_ACTORS=${APIFY_YOUTUBE_FALLBACK_ACTORS:-}
+      - APIFY_DOWNLOAD_MAX_CHARGE_USD=${APIFY_DOWNLOAD_MAX_CHARGE_USD:-6}
+      - APIFY_FALLBACK_MAX_CHARGE_USD=${APIFY_FALLBACK_MAX_CHARGE_USD:-6}
+      - APIFY_YOUTUBE_INPUT_ADAPTER=${APIFY_YOUTUBE_INPUT_ADAPTER:-start_urls}
+      - APIFY_YOUTUBE_DEFAULT_QUALITY=${APIFY_YOUTUBE_DEFAULT_QUALITY:-1080}
+      - APIFY_RUN_TIMEOUT_SECONDS=${APIFY_RUN_TIMEOUT_SECONDS:-3600}
+      - YOUTUBE_DATA_API_KEY=${YOUTUBE_DATA_API_KEY:-}
+      - YOUTUBE_METADATA_PROVIDER=${YOUTUBE_METADATA_PROVIDER:-yt_dlp}
+      - YOUTUBE_DOWNLOAD_PROVIDER=${YOUTUBE_DOWNLOAD_PROVIDER:-yt_dlp}
+      # Suporte a cookies do yt-dlp (ver BACKLOG.md item 2.1).
+      # O compose original NÃO expõe esta variável, então ela nunca chegava
+      # ao container. Caminho padrão alternativo: /app/uploads/cookies.txt
+      - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
+      - LLM=${LLM}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_FALLBACK_MODEL=${OPENROUTER_FALLBACK_MODEL:-}
+      - RERANK_LLM=${RERANK_LLM:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+      - TRANSCRIPTION_PROVIDER=${TRANSCRIPTION_PROVIDER:-assemblyai}
+      - TRANSCRIPTION_LANGUAGE=${TRANSCRIPTION_LANGUAGE:-}
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-medium}
+      - MAX_VIDEO_DURATION=${MAX_VIDEO_DURATION:-5400}
+      - PRO_YOUTUBE_MAX_VIDEO_DURATION=${PRO_YOUTUBE_MAX_VIDEO_DURATION:-5400}
+      - SCALE_YOUTUBE_MAX_VIDEO_DURATION=${SCALE_YOUTUBE_MAX_VIDEO_DURATION:-10800}
+      - MAX_VIDEO_UPLOAD_BYTES=${MAX_VIDEO_UPLOAD_BYTES:-12000000000}
+      - QUEUED_TASK_TIMEOUT_SECONDS=${QUEUED_TASK_TIMEOUT_SECONDS:-180}
+      - DEFAULT_PROCESSING_MODE=${DEFAULT_PROCESSING_MODE:-fast}
+      - MAX_CLIPS=${MAX_CLIPS:-10}
+      - FAST_MODE_MAX_CLIPS=${FAST_MODE_MAX_CLIPS:-10}
+      - SPEAKER_FRAMING=${SPEAKER_FRAMING:-true}
+      - HOOK_FIRST_TEASER=${HOOK_FIRST_TEASER:-true}
+      - FAST_MODE_TRANSCRIPT_MODEL=${FAST_MODE_TRANSCRIPT_MODEL:-universal}
+      - SELF_HOST=${SELF_HOST:-true}
+      - BACKEND_AUTH_SECRET=${BACKEND_AUTH_SECRET}
+      - APP_SETTINGS_ENCRYPTION_KEY=${APP_SETTINGS_ENCRYPTION_KEY}
+      - AUTH_SIGNATURE_TTL_SECONDS=${AUTH_SIGNATURE_TTL_SECONDS:-300}
+      - ALLOW_UNSIGNED_BACKEND_AUTH=${ALLOW_UNSIGNED_BACKEND_AUTH:-false}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - FREE_PLAN_TASK_LIMIT=${FREE_PLAN_TASK_LIMIT:-10}
+      - PRO_PLAN_TASK_LIMIT=${PRO_PLAN_TASK_LIMIT:-50}
+      - SCALE_PLAN_TASK_LIMIT=${SCALE_PLAN_TASK_LIMIT:-300}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - "SES_FROM_EMAIL=${SES_FROM_EMAIL:-SupoClip <onboarding@example.com>}"
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+      - DISCORD_FEEDBACK_WEBHOOK_URL=${DISCORD_FEEDBACK_WEBHOOK_URL:-}
+      - DISCORD_SALES_WEBHOOK_URL=${DISCORD_SALES_WEBHOOK_URL:-}
+      - YOUTUBE_OAUTH_CLIENT_ID=${YOUTUBE_OAUTH_CLIENT_ID:-}
+      - YOUTUBE_OAUTH_CLIENT_SECRET=${YOUTUBE_OAUTH_CLIENT_SECRET:-}
+      - TIKTOK_CLIENT_KEY=${TIKTOK_CLIENT_KEY:-}
+      - TIKTOK_CLIENT_SECRET=${TIKTOK_CLIENT_SECRET:-}
+      - INSTAGRAM_APP_ID=${INSTAGRAM_APP_ID:-}
+      - INSTAGRAM_APP_SECRET=${INSTAGRAM_APP_SECRET:-}
+      - SOCIAL_OAUTH_REDIRECT_BASE_URL=${SOCIAL_OAUTH_REDIRECT_BASE_URL:-}
+      - SOCIAL_PUBLIC_MEDIA_BASE_URL=${SOCIAL_PUBLIC_MEDIA_BASE_URL:-}
+      - SOCIAL_METRICS_REFRESH_HOURS=${SOCIAL_METRICS_REFRESH_HOURS:-6}
+      - SOCIAL_METRICS_MAX_POST_AGE_DAYS=${SOCIAL_METRICS_MAX_POST_AGE_DAYS:-60}
+      - SOCIAL_PERFORMANCE_MIN_POSTS=${SOCIAL_PERFORMANCE_MIN_POSTS:-3}
+      - SOCIAL_PUBLISHING_ACCESS=${SOCIAL_PUBLISHING_ACCESS:-all}
+      - SOCIAL_PUBLISHING_ALLOWED_EMAILS=${SOCIAL_PUBLISHING_ALLOWED_EMAILS:-}
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/db"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        BACKEND_CPU_ONLY: ${BACKEND_CPU_ONLY:-true}
+    container_name: supoclip-worker
+    platform: ${BACKEND_PLATFORM:-linux/amd64}
+    command: [".venv/bin/arq", "src.workers.tasks.WorkerSettings"]
+    volumes:
+      - uploads:/app/uploads
+      - clips:/app/clips
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - "DATABASE_URL=postgresql+asyncpg://supoclip:${POSTGRES_PASSWORD}@postgres:5432/supoclip"
+      - TEMP_DIR=/app/uploads
+      - MEDIA_STORAGE=${MEDIA_STORAGE:-local}
+      - MEDIA_S3_BUCKET=${MEDIA_S3_BUCKET:-}
+      - MEDIA_S3_PREFIX=${MEDIA_S3_PREFIX:-media}
+      - MEDIA_S3_REGION=${MEDIA_S3_REGION:-eu-central-1}
+      - MEDIA_S3_ENDPOINT=${MEDIA_S3_ENDPOINT:-}
+      - MEDIA_S3_ACCESS_KEY_ID=${MEDIA_S3_ACCESS_KEY_ID:-}
+      - MEDIA_S3_SECRET_ACCESS_KEY=${MEDIA_S3_SECRET_ACCESS_KEY:-}
+      - MEDIA_S3_SESSION_TOKEN=${MEDIA_S3_SESSION_TOKEN:-}
+      - MEDIA_URL_TTL_SECONDS=${MEDIA_URL_TTL_SECONDS:-900}
+      - MEDIA_CACHE_TTL_SECONDS=${MEDIA_CACHE_TTL_SECONDS:-86400}
+      - MEDIA_ORPHAN_GRACE_SECONDS=${MEDIA_ORPHAN_GRACE_SECONDS:-86400}
+      - MEDIA_UPLOAD_CONCURRENCY=${MEDIA_UPLOAD_CONCURRENCY:-3}
+      - MEDIA_UPLOAD_DAILY_LIMIT=${MEDIA_UPLOAD_DAILY_LIMIT:-20}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - ASSEMBLY_AI_API_KEY=${ASSEMBLY_AI_API_KEY}
+      - ASSEMBLY_AI_HTTP_TIMEOUT_SECONDS=${ASSEMBLY_AI_HTTP_TIMEOUT_SECONDS:-900}
+      - APIFY_API_TOKEN=${APIFY_API_TOKEN:-}
+      - APIFY_YOUTUBE_DOWNLOADER_ACTOR=${APIFY_YOUTUBE_DOWNLOADER_ACTOR:-}
+      - APIFY_YOUTUBE_PROVIDERS=${APIFY_YOUTUBE_PROVIDERS:-}
+      - APIFY_STORAGE_BUCKET=${APIFY_STORAGE_BUCKET:-}
+      - APIFY_STORAGE_REGION=${APIFY_STORAGE_REGION:-}
+      - APIFY_STORAGE_WRITER_ACCESS_KEY_ID=${APIFY_STORAGE_WRITER_ACCESS_KEY_ID:-}
+      - APIFY_STORAGE_WRITER_SECRET_ACCESS_KEY=${APIFY_STORAGE_WRITER_SECRET_ACCESS_KEY:-}
+      - APIFY_STORAGE_READER_ACCESS_KEY_ID=${APIFY_STORAGE_READER_ACCESS_KEY_ID:-}
+      - APIFY_STORAGE_READER_SECRET_ACCESS_KEY=${APIFY_STORAGE_READER_SECRET_ACCESS_KEY:-}
+      - APIFY_STORAGE_KEY_TEMPLATE=${APIFY_STORAGE_KEY_TEMPLATE:-}
+      - APIFY_YOUTUBE_FALLBACK_ACTOR=${APIFY_YOUTUBE_FALLBACK_ACTOR:-}
+      - APIFY_YOUTUBE_FALLBACK_ACTORS=${APIFY_YOUTUBE_FALLBACK_ACTORS:-}
+      - APIFY_DOWNLOAD_MAX_CHARGE_USD=${APIFY_DOWNLOAD_MAX_CHARGE_USD:-6}
+      - APIFY_FALLBACK_MAX_CHARGE_USD=${APIFY_FALLBACK_MAX_CHARGE_USD:-6}
+      - APIFY_YOUTUBE_INPUT_ADAPTER=${APIFY_YOUTUBE_INPUT_ADAPTER:-start_urls}
+      - APIFY_YOUTUBE_DEFAULT_QUALITY=${APIFY_YOUTUBE_DEFAULT_QUALITY:-1080}
+      - APIFY_RUN_TIMEOUT_SECONDS=${APIFY_RUN_TIMEOUT_SECONDS:-3600}
+      - YOUTUBE_DATA_API_KEY=${YOUTUBE_DATA_API_KEY:-}
+      - YOUTUBE_METADATA_PROVIDER=${YOUTUBE_METADATA_PROVIDER:-yt_dlp}
+      - YOUTUBE_DOWNLOAD_PROVIDER=${YOUTUBE_DOWNLOAD_PROVIDER:-yt_dlp}
+      - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
+      - LLM=${LLM}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_FALLBACK_MODEL=${OPENROUTER_FALLBACK_MODEL:-}
+      - RERANK_LLM=${RERANK_LLM:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+      - TRANSCRIPTION_PROVIDER=${TRANSCRIPTION_PROVIDER:-assemblyai}
+      - TRANSCRIPTION_LANGUAGE=${TRANSCRIPTION_LANGUAGE:-}
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-medium}
+      - MAX_VIDEO_DURATION=${MAX_VIDEO_DURATION:-5400}
+      - PRO_YOUTUBE_MAX_VIDEO_DURATION=${PRO_YOUTUBE_MAX_VIDEO_DURATION:-5400}
+      - SCALE_YOUTUBE_MAX_VIDEO_DURATION=${SCALE_YOUTUBE_MAX_VIDEO_DURATION:-10800}
+      - QUEUED_TASK_TIMEOUT_SECONDS=${QUEUED_TASK_TIMEOUT_SECONDS:-180}
+      - DEFAULT_PROCESSING_MODE=${DEFAULT_PROCESSING_MODE:-fast}
+      - MAX_CLIPS=${MAX_CLIPS:-10}
+      - FAST_MODE_MAX_CLIPS=${FAST_MODE_MAX_CLIPS:-10}
+      - SPEAKER_FRAMING=${SPEAKER_FRAMING:-true}
+      - HOOK_FIRST_TEASER=${HOOK_FIRST_TEASER:-true}
+      - FAST_MODE_TRANSCRIPT_MODEL=${FAST_MODE_TRANSCRIPT_MODEL:-universal}
+      - SELF_HOST=${SELF_HOST:-true}
+      - BACKEND_AUTH_SECRET=${BACKEND_AUTH_SECRET}
+      - APP_SETTINGS_ENCRYPTION_KEY=${APP_SETTINGS_ENCRYPTION_KEY}
+      - AUTH_SIGNATURE_TTL_SECONDS=${AUTH_SIGNATURE_TTL_SECONDS:-300}
+      - ALLOW_UNSIGNED_BACKEND_AUTH=${ALLOW_UNSIGNED_BACKEND_AUTH:-false}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - FREE_PLAN_TASK_LIMIT=${FREE_PLAN_TASK_LIMIT:-10}
+      - PRO_PLAN_TASK_LIMIT=${PRO_PLAN_TASK_LIMIT:-50}
+      - SCALE_PLAN_TASK_LIMIT=${SCALE_PLAN_TASK_LIMIT:-300}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - "SES_FROM_EMAIL=${SES_FROM_EMAIL:-SupoClip <onboarding@example.com>}"
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+      - YOUTUBE_OAUTH_CLIENT_ID=${YOUTUBE_OAUTH_CLIENT_ID:-}
+      - YOUTUBE_OAUTH_CLIENT_SECRET=${YOUTUBE_OAUTH_CLIENT_SECRET:-}
+      - TIKTOK_CLIENT_KEY=${TIKTOK_CLIENT_KEY:-}
+      - TIKTOK_CLIENT_SECRET=${TIKTOK_CLIENT_SECRET:-}
+      - INSTAGRAM_APP_ID=${INSTAGRAM_APP_ID:-}
+      - INSTAGRAM_APP_SECRET=${INSTAGRAM_APP_SECRET:-}
+      - SOCIAL_OAUTH_REDIRECT_BASE_URL=${SOCIAL_OAUTH_REDIRECT_BASE_URL:-}
+      - SOCIAL_PUBLIC_MEDIA_BASE_URL=${SOCIAL_PUBLIC_MEDIA_BASE_URL:-}
+      - SOCIAL_METRICS_REFRESH_HOURS=${SOCIAL_METRICS_REFRESH_HOURS:-6}
+      - SOCIAL_METRICS_MAX_POST_AGE_DAYS=${SOCIAL_METRICS_MAX_POST_AGE_DAYS:-60}
+      - SOCIAL_PERFORMANCE_MIN_POSTS=${SOCIAL_PERFORMANCE_MIN_POSTS:-3}
+      - SOCIAL_PUBLISHING_ACCESS=${SOCIAL_PUBLISHING_ACCESS:-all}
+      - SOCIAL_PUBLISHING_ALLOWED_EMAILS=${SOCIAL_PUBLISHING_ALLOWED_EMAILS:-}
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD", ".venv/bin/arq", "--check", "src.workers.tasks.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  mcp:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    container_name: supoclip-mcp
+    expose:
+      - "9100"
+    volumes:
+      - mcp_downloads:/app/supoclip-downloads
+    environment:
+      - SUPOCLIP_API_URL=${SUPOCLIP_API_URL:-http://backend:8000}
+      - SUPOCLIP_DOWNLOAD_DIR=/app/supoclip-downloads
+      - SUPOCLIP_TIMEOUT=${SUPOCLIP_TIMEOUT:-60}
+      - SUPOCLIP_MCP_TRANSPORT=${SUPOCLIP_MCP_TRANSPORT:-sse}
+      - SUPOCLIP_MCP_HOST=0.0.0.0
+      - SUPOCLIP_MCP_PORT=9100
+      - SUPOCLIP_MCP_PUBLIC_URL=${SUPOCLIP_MCP_PUBLIC_URL:-}
+      - SUPOCLIP_MCP_REQUIRE_BEARER_AUTH=${SUPOCLIP_MCP_REQUIRE_BEARER_AUTH:-true}
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1', 9100), 5); s.close()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: supoclip-redis
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    command:
+      [
+        "sh",
+        "-c",
+        'if [ -n "$${REDIS_PASSWORD}" ]; then exec docker-entrypoint.sh redis-server --requirepass "$${REDIS_PASSWORD}"; fi; exec docker-entrypoint.sh redis-server',
+      ]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'if [ -n "$${REDIS_PASSWORD}" ]; then redis-cli -a "$${REDIS_PASSWORD}" ping; else redis-cli ping; fi',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: supoclip-postgres
+    environment:
+      POSTGRES_DB: supoclip
+      POSTGRES_USER: supoclip
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # init.sql roda APENAS na primeira inicialização do volume (cria o
+      # schema e a extensão uuid-ossp). Depois disso, nada atualiza o schema
+      # sozinho — veja BACKLOG.md e o checklist de upgrade do app.
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supoclip -d supoclip"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# NÃO incluído aqui: o serviço `ollama` que existe no docker-compose.yml
+# (adicionado localmente). Ele soma 9,37 GB de imagem e RAM parada. Se quiser
+# transcrição/análise 100% local, adicione-o de volta e aponte LLM=ollama:<modelo>.
+# Este compose também usa a rede `dokploy-network` em vez de `supoclip-network`,
+# porque o Traefik da Dokploy precisa alcançar os serviços.
+
+volumes:
+  uploads:
+    driver: local
+  clips:
+    driver: local
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  mcp_downloads:
+    driver: local
+
+networks:
+  dokploy-network:
+    external: true
