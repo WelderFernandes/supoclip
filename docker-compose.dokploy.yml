@@ -20,6 +20,12 @@
 
 services:
   frontend:
+    # Nome de imagem próprio. O docker-compose.yml (desenvolvimento) usa a tag
+    # `supoclip-frontend` neste mesmo clone; sem isto, um build de produção
+    # sobrescreveria a imagem que o ambiente de dev referencia, e um
+    # `docker compose up -d frontend` no dev recriaria o container a partir do
+    # build de produção (que roda `node server.js`, não `pnpm run dev`).
+    image: supoclip-frontend-prod
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -91,6 +97,8 @@ services:
       start_period: 60s
 
   backend:
+    # Ver a nota de `image` no serviço frontend.
+    image: supoclip-backend-prod
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -235,6 +243,7 @@ services:
       start_period: 60s
 
   worker:
+    image: supoclip-worker-prod
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -359,6 +368,7 @@ services:
       start_period: 60s
 
   mcp:
+    image: supoclip-mcp-prod
     build:
       context: ./mcp
       dockerfile: Dockerfile
