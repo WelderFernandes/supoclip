@@ -84,7 +84,15 @@ services:
         BACKEND_CPU_ONLY: ${BACKEND_CPU_ONLY:-false}
     container_name: supoclip-backend
     platform: linux/amd64
-    command: [".venv/bin/uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command:
+      [
+        ".venv/bin/uvicorn",
+        "src.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -226,7 +234,13 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 9100), 5); s.close()"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1', 9100), 5); s.close()",
+        ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -352,7 +366,8 @@ services:
         condition: service_healthy
 
     healthcheck:
-      test: ["CMD", ".venv/bin/arq", "--check", "src.workers.tasks.WorkerSettings"]
+      test:
+        ["CMD", ".venv/bin/arq", "--check", "src.workers.tasks.WorkerSettings"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -370,7 +385,7 @@ services:
       [
         "sh",
         "-c",
-        "if [ -n \"$${REDIS_PASSWORD}\" ]; then exec docker-entrypoint.sh redis-server --requirepass \"$${REDIS_PASSWORD}\"; fi; exec docker-entrypoint.sh redis-server",
+        'if [ -n "$${REDIS_PASSWORD}" ]; then exec docker-entrypoint.sh redis-server --requirepass "$${REDIS_PASSWORD}"; fi; exec docker-entrypoint.sh redis-server',
       ]
     volumes:
       - redis_data:/data
@@ -379,7 +394,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "if [ -n \"$${REDIS_PASSWORD}\" ]; then redis-cli -a \"$${REDIS_PASSWORD}\" ping; else redis-cli ping; fi",
+          'if [ -n "$${REDIS_PASSWORD}" ]; then redis-cli -a "$${REDIS_PASSWORD}" ping; else redis-cli ping; fi',
         ]
       interval: 30s
       timeout: 10s
@@ -402,6 +417,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
 
 volumes:
   uploads:
@@ -413,6 +433,8 @@ volumes:
   postgres_data:
     driver: local
   mcp_downloads:
+    driver: local
+  ollama_models:
     driver: local
 
 networks:
